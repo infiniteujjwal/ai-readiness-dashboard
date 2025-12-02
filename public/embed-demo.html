@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Readiness Dashboard - Embed Demo</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 40px 20px;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        
+        header {
+            text-align: center;
+            margin-bottom: 40px;
+            color: white;
+        }
+        
+        header h1 {
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+            text-shadow: 0 2px 4px rgba(0,0,0,0.2);
+        }
+        
+        header p {
+            font-size: 1.1rem;
+            opacity: 0.9;
+        }
+        
+        .demo-section {
+            background: white;
+            border-radius: 16px;
+            padding: 30px;
+            margin-bottom: 30px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+        }
+        
+        .demo-section h2 {
+            color: #1e293b;
+            margin-bottom: 20px;
+            font-size: 1.5rem;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .demo-section h2::before {
+            content: '';
+            width: 4px;
+            height: 24px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-radius: 2px;
+        }
+        
+        .code-block {
+            background: #1e293b;
+            color: #e2e8f0;
+            padding: 20px;
+            border-radius: 8px;
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 14px;
+            overflow-x: auto;
+            margin: 15px 0;
+        }
+        
+        .code-block .comment {
+            color: #64748b;
+        }
+        
+        .code-block .tag {
+            color: #f472b6;
+        }
+        
+        .code-block .attr {
+            color: #38bdf8;
+        }
+        
+        .code-block .string {
+            color: #4ade80;
+        }
+        
+        .controls {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+        
+        .control-group {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .control-group label {
+            font-weight: 500;
+            color: #475569;
+        }
+        
+        .control-group input[type="checkbox"] {
+            width: 18px;
+            height: 18px;
+            cursor: pointer;
+        }
+        
+        .control-group input[type="text"],
+        .control-group select {
+            padding: 8px 12px;
+            border: 1px solid #e2e8f0;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+        
+        button {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+        
+        button.secondary {
+            background: #f1f5f9;
+            color: #475569;
+        }
+        
+        button.secondary:hover {
+            background: #e2e8f0;
+            box-shadow: none;
+            transform: none;
+        }
+        
+        #dashboard-container {
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+        }
+        
+        .method-tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        
+        .method-tab {
+            padding: 10px 20px;
+            background: #f1f5f9;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 500;
+            color: #64748b;
+            transition: all 0.2s;
+        }
+        
+        .method-tab.active {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+        
+        .method-content {
+            display: none;
+        }
+        
+        .method-content.active {
+            display: block;
+        }
+        
+        .api-section {
+            background: #f8fafc;
+            padding: 20px;
+            border-radius: 8px;
+            margin-top: 20px;
+        }
+        
+        .api-section h3 {
+            color: #334155;
+            margin-bottom: 15px;
+        }
+        
+        .api-method {
+            background: white;
+            padding: 15px;
+            border-radius: 6px;
+            margin-bottom: 10px;
+            border-left: 3px solid #667eea;
+        }
+        
+        .api-method code {
+            background: #e2e8f0;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 13px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🚀 AI Readiness Dashboard</h1>
+            <p>Embed this interactive dashboard anywhere - SharePoint, Teams, your website, or any web application</p>
+        </header>
+        
+        <!-- Embedding Methods -->
+        <div class="demo-section">
+            <h2>Embedding Methods</h2>
+            
+            <div class="method-tabs">
+                <button class="method-tab active" onclick="showMethod('iframe')">iframe</button>
+                <button class="method-tab" onclick="showMethod('script')">Script Tag</button>
+                <button class="method-tab" onclick="showMethod('api')">JavaScript API</button>
+            </div>
+            
+            <!-- iframe Method -->
+            <div id="method-iframe" class="method-content active">
+                <p style="color: #64748b; margin-bottom: 15px;">The simplest way to embed - just copy and paste this iframe code:</p>
+                <div class="code-block">
+<span class="comment">&lt;!-- Simple iframe embed --&gt;</span>
+<span class="tag">&lt;iframe</span>
+    <span class="attr">src</span>=<span class="string">"http://localhost:3000/embed"</span>
+    <span class="attr">width</span>=<span class="string">"100%"</span>
+    <span class="attr">height</span>=<span class="string">"900px"</span>
+    <span class="attr">frameborder</span>=<span class="string">"0"</span>
+    <span class="attr">style</span>=<span class="string">"border: none; border-radius: 8px;"</span>
+<span class="tag">&gt;&lt;/iframe&gt;</span>
+                </div>
+                
+                <p style="color: #64748b; margin: 15px 0;">With customization options:</p>
+                <div class="code-block">
+<span class="comment">&lt;!-- Customized embed --&gt;</span>
+<span class="tag">&lt;iframe</span>
+    <span class="attr">src</span>=<span class="string">"http://localhost:3000/embed?hideHeader=true&compact=true"</span>
+    <span class="attr">width</span>=<span class="string">"100%"</span>
+    <span class="attr">height</span>=<span class="string">"700px"</span>
+<span class="tag">&gt;&lt;/iframe&gt;</span>
+                </div>
+            </div>
+            
+            <!-- Script Method -->
+            <div id="method-script" class="method-content">
+                <p style="color: #64748b; margin-bottom: 15px;">Use our embed script for more control:</p>
+                <div class="code-block">
+<span class="comment">&lt;!-- Container for the dashboard --&gt;</span>
+<span class="tag">&lt;div</span> <span class="attr">id</span>=<span class="string">"ai-readiness-dashboard"</span>
+     <span class="attr">data-height</span>=<span class="string">"900px"</span>
+     <span class="attr">data-hide-header</span>=<span class="string">"false"</span>
+     <span class="attr">data-compact</span>=<span class="string">"false"</span><span class="tag">&gt;&lt;/div&gt;</span>
+
+<span class="comment">&lt;!-- Load the embed script --&gt;</span>
+<span class="tag">&lt;script</span> <span class="attr">src</span>=<span class="string">"http://localhost:3000/embed.js"</span><span class="tag">&gt;&lt;/script&gt;</span>
+                </div>
+            </div>
+            
+            <!-- API Method -->
+            <div id="method-api" class="method-content">
+                <p style="color: #64748b; margin-bottom: 15px;">Full JavaScript API for programmatic control:</p>
+                <div class="code-block">
+<span class="comment">// Configure before loading</span>
+window.AIReadinessConfig = {
+    containerId: 'my-dashboard',
+    height: '800px',
+    hideHeader: false,
+    onLoad: function() {
+        console.log('Dashboard loaded!');
+    },
+    onDataChange: function(data) {
+        console.log('Data updated:', data);
+    }
+};
+                </div>
+                
+                <div class="api-section">
+                    <h3>Available API Methods</h3>
+                    <div class="api-method">
+                        <code>AIReadinessDashboard.loadCSV(csvText)</code>
+                        <p style="color: #64748b; margin-top: 5px;">Load CSV data programmatically</p>
+                    </div>
+                    <div class="api-method">
+                        <code>AIReadinessDashboard.resize(height)</code>
+                        <p style="color: #64748b; margin-top: 5px;">Resize the dashboard iframe</p>
+                    </div>
+                    <div class="api-method">
+                        <code>AIReadinessDashboard.reload()</code>
+                        <p style="color: #64748b; margin-top: 5px;">Reload the dashboard</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Live Demo -->
+        <div class="demo-section">
+            <h2>Live Demo</h2>
+            
+            <div class="controls">
+                <div class="control-group">
+                    <input type="checkbox" id="hideHeader" onchange="updateEmbed()">
+                    <label for="hideHeader">Hide Header</label>
+                </div>
+                <div class="control-group">
+                    <input type="checkbox" id="hideFooter" onchange="updateEmbed()">
+                    <label for="hideFooter">Hide Footer</label>
+                </div>
+                <div class="control-group">
+                    <input type="checkbox" id="compact" onchange="updateEmbed()">
+                    <label for="compact">Compact Mode</label>
+                </div>
+                <div class="control-group">
+                    <label for="height">Height:</label>
+                    <select id="height" onchange="updateEmbed()">
+                        <option value="600px">600px</option>
+                        <option value="800px">800px</option>
+                        <option value="900px" selected>900px</option>
+                        <option value="1000px">1000px</option>
+                        <option value="100vh">Full Height</option>
+                    </select>
+                </div>
+                <button onclick="updateEmbed()">Apply Changes</button>
+                <button class="secondary" onclick="loadSampleData()">Load Sample Data</button>
+            </div>
+            
+            <!-- The embedded dashboard will appear here -->
+            <div id="dashboard-container" data-height="900px"></div>
+        </div>
+    </div>
+    
+    <!-- Load the embed script -->
+    <script>
+        window.AIReadinessConfig = {
+            containerId: 'dashboard-container',
+            height: '900px',
+            onLoad: function() {
+                console.log('✅ AI Readiness Dashboard loaded successfully!');
+            },
+            onDataChange: function(data) {
+                console.log('📊 Data changed:', data);
+            }
+        };
+    </script>
+    <script src="/embed.js"></script>
+    
+    <script>
+        function showMethod(method) {
+            // Update tabs
+            document.querySelectorAll('.method-tab').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            event.target.classList.add('active');
+            
+            // Update content
+            document.querySelectorAll('.method-content').forEach(content => {
+                content.classList.remove('active');
+            });
+            document.getElementById('method-' + method).classList.add('active');
+        }
+        
+        function updateEmbed() {
+            const hideHeader = document.getElementById('hideHeader').checked;
+            const hideFooter = document.getElementById('hideFooter').checked;
+            const compact = document.getElementById('compact').checked;
+            const height = document.getElementById('height').value;
+            
+            // Build new URL
+            let url = '/embed';
+            const params = [];
+            if (hideHeader) params.push('hideHeader=true');
+            if (hideFooter) params.push('hideFooter=true');
+            if (compact) params.push('compact=true');
+            if (params.length > 0) url += '?' + params.join('&');
+            
+            // Update iframe
+            const iframe = document.getElementById('ai-readiness-iframe');
+            if (iframe) {
+                iframe.src = url;
+                iframe.style.height = height;
+            }
+        }
+        
+        function loadSampleData() {
+            // Sample CSV data for testing
+            const sampleCSV = `SiteName,FileCount,FileSize,LastModifiedDate,SharingLevel,CopilotReadinessFlag
+Marketing Site,1250,524288,2024-11-15,Everyone,Ready
+HR Portal,890,262144,2024-10-20,Only Org,Not Ready
+Engineering Docs,3400,1048576,2024-11-28,External,Ready
+Finance Reports,650,131072,2024-06-15,Only Org,Ready
+Sales Dashboard,2100,786432,2024-11-25,Everyone,Ready
+Legal Documents,420,98304,2024-03-10,Only Org,Not Ready
+Product Wiki,1800,655360,2024-11-20,External,Ready
+Customer Support,950,327680,2024-11-22,Everyone,Not Ready
+Executive Reports,180,65536,2024-11-01,Only Org,Ready
+Training Materials,560,409600,2024-08-30,Everyone,Not Ready`;
+            
+            // Send to embedded dashboard
+            if (window.AIReadinessDashboard) {
+                window.AIReadinessDashboard.loadCSV(sampleCSV);
+                console.log('📤 Sample data sent to dashboard');
+            }
+        }
+    </script>
+</body>
+</html>
+

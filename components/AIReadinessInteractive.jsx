@@ -1,0 +1,898 @@
+// AIReadinessInteractive.jsx
+"use client";
+
+import React, { useMemo, useState, useCallback, useEffect } from "react";
+
+import {
+  PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis,
+  CartesianGrid, Tooltip, Legend, ResponsiveContainer
+} from "recharts";
+
+import {
+  ShieldAlert, CheckCircle, Database, LayoutDashboard, FileText,
+  Lock, Users, AlertTriangle, ChevronRight, FileText as FileIcon,
+  Clock, ArrowUpDown, Download, ChevronDown
+} from "lucide-react";
+
+/*
+  Requirements implemented:
+  - Upload CSV and parse locally (custom parser replacing PapaParse)
+  - Compute aggregated metrics: unique sites, public sites, everyone/external %, total storage (KB -> MB/GB), top sites by file count
+  - Raw per-site table (unique site rows) and full-row expand (show underlying CSV rows for that site)
+  - Download exports (CSV and JSON) for filtered sets
+  - Sorting and filtering on site table
+  - Sharing-level classification (refined heuristics)
+  - Staleness calculation by LastModifiedDate
+  - Copilot readiness detection via CopilotReadinessFlag or similar
+  - All charts update reactively when CSV changes
+  
+  UPDATES:
+  - Added 'gravityMetric' toggle to sort Top Sites by File Count OR Storage Size.
+  - Added 'Stale Content' section with expandable list to show individual stale files.
+*/
+
+/* ---------- Utilities ---------- */
+const hrBytes = (kb) => {
+  if (!Number.isFinite(kb)) return "0 KB";
+  const mb = kb / 1024;
+  const gb = mb / 1024;
+  if (gb >= 1) return `${Number(gb.toFixed(2))} GB`;
+  if (mb >= 1) return `${Number(mb.toFixed(2))} MB`;
+  return `${Number(kb.toFixed(2))} KB`;
+};
+
+const parseNumber = (v) => {
+  if (v == null) return 0;
+  const n = Number(String(v).replace(/[^0-9\.\-]/g, ""));
+  return Number.isFinite(n) ? n : 0;
+};
+
+const guessSiteColumn = (headers) => {
+  const candidates = headers.filter(h =>
+    /site(name|_name)?$|^site$|siteurl|weburl|web url/i.test(h)
+  );
+  return candidates.length ? candidates[0] : headers[0];
+};
+
+const findColumns = (headers, keywords) => {
+  const lower = headers.map(h => h.toLowerCase());
+  for (const k of keywords) {
+    const matchIdx = lower.findIndex(h => h.includes(k.toLowerCase()));
+    if (matchIdx >= 0) return headers[matchIdx];
+  }
+  return null;
+};
+
+// Sharing classification: return ranking (higher => more permissive)
+const classifySharing = (rowText) => {
+  // normalized text
+  const t = (rowText || "").toLowerCase();
+
+  if (!t) return { level: "Only Org", rank: 1 };
+
+  // most permissive: anyone / anonymous / public
+  if (/\b(anyone|anyonewithlink|anyone with the link|anonymous|public)\b/.test(t)) {
+    return { level: "External (Anonymous)", rank: 4 };
+  }
+  // guests / external / new external
+  if (/\b(guest|external|new external|new & existing|new and existing|newexisting)\b/.test(t)) {
+    return { level: "External (New & Existing)", rank: 3 };
+  }
+  // everyone (org-wide)
+  if (/\beveryone\b/.test(t)) {
+    return { level: "Everyone", rank: 2 };
+  }
+  return { level: "Only Org", rank: 1 };
+};
+
+// Custom CSV Parser to replace papaparse dependency
+const parseCSV = (csvText) => {
+  const lines = csvText.split(/\r\n|\n/);
+  const result = [];
+  const headers = [];
+
+  // Helper to split a line by comma, respecting quotes
+  const splitLine = (line) => {
+    const values = [];
+    let current = '';
+    let inQuote = false;
+    for (let i = 0; i < line.length; i++) {
+      const char = line[i];
+      if (char === '"') {
+        if (i + 1 < line.length && line[i + 1] === '"') {
+          current += '"';
+          i++;
+        } else {
+          inQuote = !inQuote;
+        }
+      } else if (char === ',' && !inQuote) {
+        values.push(current.trim());
+        current = '';
+      } else {
+        current += char;
+      }
+    }
+    values.push(current.trim());
+    return values.map(v => v.replace(/^"|"$/g, ''));
+  };
+
+  let headerFound = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+
+    if (!headerFound) {
+      headers.push(...splitLine(line));
+      headerFound = true;
+    } else {
+      const values = splitLine(line);
+      if (values.length) {
+        const row = {};
+        headers.forEach((h, index) => {
+          row[h] = values[index] || "";
+        });
+        result.push(row);
+      }
+    }
+  }
+
+  return { data: result, meta: { fields: headers } };
+};
+
+/* ---------- Component ---------- */
+export default function AIReadinessInteractive({ 
+  isEmbedded = false, 
+  hideHeader = false, 
+  hideFooter = false, 
+  compact = false 
+}) {
+  const [rawCsv, setRawCsv] = useState(null);           
+  const [rows, setRows] = useState([]);                 
+  const [headers, setHeaders] = useState([]);           
+  const [siteKey, setSiteKey] = useState(null);         
+  const [fileCountKey, setFileCountKey] = useState(null);
+  const [fileSizeKey, setFileSizeKey] = useState(null);
+  const [lastModKey, setLastModKey] = useState(null);
+  const [copilotKey, setCopilotKey] = useState(null);
+  
+  const [filter, setFilter] = useState({ search: "", sharing: "all" });
+  const [sort, setSort] = useState({ key: "files", dir: "desc" });
+  const [expandedSite, setExpandedSite] = useState(null);
+  // New state for toggling stale site details
+  const [expandedStaleSite, setExpandedStaleSite] = useState(null); 
+
+  // New state for toggling Data Gravity metric
+  const [gravityMetric, setGravityMetric] = useState("files"); // 'files' or 'size'
+
+  // PDF Generation State
+  const [pdfLibsLoaded, setPdfLibsLoaded] = useState(false);
+  const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
+
+  // PostMessage communication for embedded mode
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    // Notify parent that dashboard is loaded
+    if (isEmbedded) {
+      window.parent.postMessage({ type: 'AI_READINESS_LOADED' }, '*');
+    }
+
+    // Listen for messages from parent
+    const handleMessage = (event) => {
+      const data = event.data;
+      if (!data || !data.type) return;
+
+      switch (data.type) {
+        case 'LOAD_CSV_DATA':
+          if (data.csvText) {
+            try {
+              const res = parseCSV(data.csvText);
+              const parsedData = res.data || [];
+              setRows(parsedData);
+              const hdrs = res.meta.fields || (parsedData.length ? Object.keys(parsedData[0]) : []);
+              setHeaders(hdrs);
+              
+              const guessedSite = guessSiteColumn(hdrs);
+              setSiteKey(guessedSite);
+              setFileCountKey(findColumns(hdrs, ["filecount", "sitefilecount", "itemcount", "documentcount", "count"]));
+              setFileSizeKey(findColumns(hdrs, ["filesize", "file_size", "size", "storageusage"]));
+              setLastModKey(findColumns(hdrs, ["lastmodified", "modified", "lastmodifieddate"]));
+              setCopilotKey(findColumns(hdrs, ["copilot", "copilotreadiness", "copilot_readiness", "copilot_readiness_flag"]));
+              
+              // Notify parent of successful load
+              window.parent.postMessage({ 
+                type: 'AI_READINESS_DATA_CHANGE', 
+                payload: { rowCount: parsedData.length, headers: hdrs }
+              }, '*');
+            } catch (err) {
+              console.error("CSV parse error from postMessage", err);
+            }
+          }
+          break;
+        
+        default:
+          break;
+      }
+    };
+
+    window.addEventListener('message', handleMessage);
+    return () => window.removeEventListener('message', handleMessage);
+  }, [isEmbedded]);
+
+  // Load PDF libraries from CDN on mount
+  useEffect(() => {
+    const loadScript = (src) => {
+      return new Promise((resolve, reject) => {
+        if (document.querySelector(`script[src="${src}"]`)) {
+          resolve();
+          return;
+        }
+        const script = document.createElement('script');
+        script.src = src;
+        script.onload = resolve;
+        script.onerror = reject;
+        document.body.appendChild(script);
+      });
+    };
+
+    Promise.all([
+      loadScript("https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"),
+      loadScript("https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js")
+    ]).then(() => {
+      setPdfLibsLoaded(true);
+    }).catch(err => console.error("Failed to load PDF libs", err));
+  }, []);
+
+  const handleDownloadPdf = async () => {
+    if (!pdfLibsLoaded) {
+      // In a real app, use a modal/toast, not alert
+      console.error("PDF libraries are still loading.");
+      return;
+    }
+    
+    setIsGeneratingPdf(true);
+    try {
+      // Small timeout to allow UI to update (spinner etc)
+      await new Promise(r => setTimeout(r, 100));
+
+      const input = document.getElementById('dashboard-container');
+      
+      // Use window.html2canvas since it was loaded via script tag
+      const canvas = await window.html2canvas(input, {
+        scale: 2, // higher scale for better quality
+        useCORS: true,
+        logging: false
+      });
+
+      const imgData = canvas.toDataURL('image/png');
+      
+      // Access jsPDF from the global window object
+      const { jsPDF } = window.jspdf;
+      const pdf = new jsPDF('p', 'mm', 'a4');
+      
+      const pdfWidth = pdf.internal.pageSize.getWidth();
+      const pdfHeight = pdf.internal.pageSize.getHeight();
+      
+      const imgProps = pdf.getImageProperties(imgData);
+      const imgHeight = (imgProps.height * pdfWidth) / imgProps.width;
+      
+      pdf.addImage(imgData, 'PNG', 0, 0, pdfWidth, imgHeight);
+      
+      pdf.save("AI_Readiness_Report.pdf");
+    } catch (error) {
+      console.error("PDF generation failed", error);
+      // In a real app, use a modal/toast, not alert
+      console.error("Failed to generate PDF. Check console for details."); 
+    } finally {
+      setIsGeneratingPdf(false);
+    }
+  };
+
+  // ---------- parse CSV file ----------
+  const onFile = useCallback((file) => {
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const text = e.target.result;
+      try {
+        const res = parseCSV(text);
+        const data = res.data || [];
+        setRawCsv(null);
+        setRows(data);
+        const hdrs = res.meta.fields || (data.length ? Object.keys(data[0]) : []);
+        setHeaders(hdrs);
+        
+        const guessedSite = guessSiteColumn(hdrs);
+        setSiteKey(guessedSite);
+
+        const fc = findColumns(hdrs, ["filecount", "sitefilecount", "itemcount", "documentcount", "count"]);
+        setFileCountKey(fc);
+
+        const fs = findColumns(hdrs, ["filesize", "file_size", "size", "storageusage"]);
+        setFileSizeKey(fs);
+
+        const lm = findColumns(hdrs, ["lastmodified", "modified", "lastmodifieddate", "lastmodifieddate"]);
+        setLastModKey(lm);
+
+        const cop = findColumns(hdrs, ["copilot", "copilotreadiness", "copilot_readiness", "copilot_readiness_flag"]);
+        setCopilotKey(cop);
+      } catch (err) {
+        console.error("CSV parse error", err);
+      }
+    };
+    reader.readAsText(file);
+  }, []);
+
+  // ---------- derived site-level aggregation ----------
+  const siteAgg = useMemo(() => {
+    if (!rows || !rows.length || !siteKey) return { sites: [], maps: {} };
+
+    const map = new Map();
+    for (const r of rows) {
+      const s = (r[siteKey] || "(unknown)").trim();
+      if (!map.has(s)) map.set(s, []);
+      map.get(s).push(r);
+    }
+
+    const sites = [];
+    for (const [siteName, siteRows] of map.entries()) {
+      const combinedText = siteRows.map(rr => Object.values(rr).join(" ")).join(" ");
+      const sharing = classifySharing(combinedText);
+
+      let files = 0;
+      // If a file count column exists, use it. Otherwise, count the rows (assuming each row is a file/item).
+      if (fileCountKey) {
+        files = siteRows.reduce((acc, r) => acc + parseNumber(r[fileCountKey]), 0);
+      } else {
+        files = siteRows.length;
+      }
+
+      let totalKB = 0;
+      if (fileSizeKey) {
+        totalKB = siteRows.reduce((acc, r) => acc + parseNumber(r[fileSizeKey]), 0);
+      }
+
+      let lastDates = siteRows.map(r => {
+        const v = r[lastModKey];
+        const d = v ? new Date(v) : null;
+        return d && !isNaN(d) ? d : null;
+      }).filter(Boolean);
+      const lastModified = lastDates.length ? new Date(Math.max(...lastDates.map(d => d.getTime()))) : null;
+
+      let copilotReady = false;
+      if (copilotKey) {
+        copilotReady = siteRows.some(r => String(r[copilotKey] || "").toLowerCase().includes("ready"));
+      }
+
+      const visibleEveryone = /\beveryone\b/i.test(combinedText);
+      const visibleExternal = /\b(external|guest|anon|anyone)\b/i.test(combinedText);
+
+      sites.push({
+        siteName,
+        displayName: siteName,
+        files,
+        totalKB,
+        totalMB: totalKB / 1024,
+        totalGB: (totalKB / 1024) / 1024,
+        lastModified,
+        copilotReady,
+        sharingLevel: sharing.level,
+        sharingRank: sharing.rank,
+        visibleEveryone,
+        visibleExternal,
+        rawRows: siteRows
+      });
+    }
+
+    sites.sort((a,b) => b.files - a.files);
+    const maps = { byName: map };
+    return { sites, maps };
+  }, [rows, siteKey, fileCountKey, fileSizeKey, lastModKey, copilotKey]);
+
+  // ---------- computed summary metrics ----------
+  const summary = useMemo(() => {
+    const totalSites = siteAgg.sites.length;
+    const publicSites = siteAgg.sites.filter(s => s.sharingLevel === "External (Anonymous)" || s.visibleExternal).length;
+    const everyoneSites = siteAgg.sites.filter(s => s.visibleEveryone || s.visibleExternal).length;
+    const totalKB = siteAgg.sites.reduce((acc,s) => acc + (s.totalKB || 0), 0);
+    const totalFiles = siteAgg.sites.reduce((acc,s) => acc + (s.files || 0), 0);
+    const readyForCopilot = siteAgg.sites.filter(s => s.copilotReady).length;
+    
+    // Stale = older than 5 months (approx 150 days)
+    const staleThreshold = new Date();
+    staleThreshold.setDate(staleThreshold.getDate() - 150);
+    
+    // Stale site count is calculated in staleSitesList below, but we keep the threshold here
+    // for consistency.
+    
+    return {
+      totalSites,
+      publicSites,
+      publicPct: totalSites ? Math.round(publicSites / totalSites * 10000)/100 : 0,
+      everyoneSites,
+      everyonePct: totalSites ? Math.round(everyoneSites / totalSites * 10000)/100 : 0,
+      totalKB,
+      totalMB: totalKB/1024,
+      totalGB: (totalKB/1024)/1024,
+      totalFiles,
+      readyForCopilot,
+      staleThreshold // Keep this for use in staleSitesList
+    };
+  }, [siteAgg]);
+
+  // ---------- stale sites list (now includes stale files) ----------
+  const staleSitesList = useMemo(() => {
+    if (!lastModKey) return [];
+    const staleThreshold = summary.staleThreshold;
+
+    return siteAgg.sites
+      .map(s => {
+        // Find the individual rows/files within the site that are stale
+        const staleFiles = s.rawRows.filter(r => {
+          const v = r[lastModKey];
+          const d = v ? new Date(v) : null;
+          // Check if date is valid and older than the stale threshold
+          return d instanceof Date && !isNaN(d) && d < staleThreshold;
+        });
+
+        // Only include the site if it has at least one stale file
+        if (staleFiles.length === 0) return null;
+
+        // Calculate the oldest modification date among the stale files for display sorting
+        const oldestStaleDate = staleFiles.reduce((minDate, r) => {
+            const d = new Date(r[lastModKey]);
+            return d < minDate ? d : minDate;
+        }, new Date());
+
+
+        return {
+          ...s,
+          staleFileCount: staleFiles.length,
+          staleKB: staleFiles.reduce((acc, r) => acc + parseNumber(r[fileSizeKey]), 0),
+          oldestModified: oldestStaleDate,
+          staleFiles: staleFiles
+        };
+      })
+      .filter(Boolean) // Remove sites with no stale files
+      .sort((a,b) => a.oldestModified.getTime() - b.oldestModified.getTime()); // oldest site first
+  }, [siteAgg.sites, summary.staleThreshold, lastModKey, fileSizeKey]);
+
+
+  // ---------- top heavy sites (dynamic sort) ----------
+  const topHeavy = useMemo(() => {
+    let sorted = [...siteAgg.sites];
+    if (gravityMetric === 'size') {
+      sorted.sort((a, b) => b.totalKB - a.totalKB);
+    } else {
+      sorted.sort((a, b) => b.files - a.files);
+    }
+    
+    return sorted.slice(0, 10).map(s => ({
+      name: s.siteName,
+      files: s.files,
+      sizeMB: parseFloat(s.totalMB.toFixed(2)),
+      displaySize: hrBytes(s.totalKB),
+      risk: s.files > 10000 ? "Critical" : (s.files > 1000 ? "High" : (s.files > 500 ? "Medium" : "Low"))
+    }));
+  }, [siteAgg.sites, gravityMetric]);
+
+  // ---------- permission risk data (unchanged) ----------
+  const permissionRisk = useMemo(() => {
+    const uniquePermCol = headers.find(h => /unique|hasuniqu|uniqueperm/i.test(h));
+    const hasUnique = uniquePermCol ? siteAgg.sites.filter(s => {
+      return s.rawRows.some(rr => String(rr[uniquePermCol] || "").toLowerCase() === "true");
+    }).length : siteAgg.sites.length;
+
+    const inheritedClean = Math.max(0, siteAgg.sites.length - hasUnique);
+    const publicCount = siteAgg.sites.filter(s => s.sharingLevel === "External (Anonymous)" || s.visibleEveryone).length;
+
+    return [
+      { name: 'Unique Permissions', value: hasUnique, color: '#6366f1' },
+      { name: 'Inherited (Clean)', value: inheritedClean, color: '#10b981' },
+      { name: 'Public / Everyone', value: publicCount, color: '#ef4444' }
+    ];
+  }, [siteAgg, headers]);
+
+  // ---------- filters & sorting for site table (unique sites) ----------
+  const filteredSites = useMemo(() => {
+    const q = (filter.search || "").toLowerCase().trim();
+    let arr = siteAgg.sites.slice();
+
+    if (filter.sharing && filter.sharing !== "all") {
+      arr = arr.filter(s => s.sharingLevel === filter.sharing);
+    }
+    if (q) {
+      arr = arr.filter(s => s.siteName.toLowerCase().includes(q));
+    }
+
+    arr.sort((a,b) => {
+      const k = sort.key;
+      const dir = sort.dir === "asc" ? 1 : -1;
+      if (k === "name") return dir * a.siteName.localeCompare(b.siteName);
+      if (k === "files") return dir * (a.files - b.files);
+      if (k === "kb") return dir * (a.totalKB - b.totalKB);
+      if (k === "last") {
+        const at = a.lastModified ? a.lastModified.getTime() : 0;
+        const bt = b.lastModified ? b.lastModified.getTime() : 0;
+        return dir * (at - bt);
+      }
+      return 0;
+    });
+
+    return arr;
+  }, [siteAgg, filter, sort]);
+
+  // ---------- export helpers ----------
+  const downloadJSON = (payload, filename = "export.json") => {
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  const downloadCSV = (arr, filename = "export.csv") => {
+    if (!arr || !arr.length) return;
+    const keys = Object.keys(arr[0]);
+    const lines = [keys.join(",")];
+    for (const r of arr) {
+      const vals = keys.map(k => `"${String(r[k] ?? "").replace(/"/g,'""')}"`);
+      lines.push(vals.join(","));
+    }
+    const blob = new Blob([lines.join("\n")], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a"); a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <div className={`min-h-screen bg-slate-50 ${compact ? 'p-3' : 'p-6'}`} id="dashboard-container">
+      {!hideHeader && (
+      <header className="flex items-center justify-between mb-6 flex-wrap gap-4">
+        <div>
+          <h1 className={`${compact ? 'text-xl' : 'text-2xl'} font-bold`}>Interactive Copilot Readiness</h1>
+          <p className="text-sm text-slate-500">Upload your SharePoint sites CSV to populate the dashboard</p>
+        </div>
+        <div className="flex items-center space-x-3 flex-wrap">
+          <label className="bg-white px-3 py-2 rounded shadow-sm border cursor-pointer text-sm hover:bg-slate-50 transition-colors">
+            Upload CSV
+            <input type="file" accept=".csv,text/csv" onChange={(e) => onFile(e.target.files[0])} className="hidden" />
+          </label>
+          
+          <button
+            className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-2 rounded shadow-sm text-sm transition-colors"
+            onClick={() => {
+              const exportArr = filteredSites.map(s => ({
+                SiteName: s.siteName,
+                Files: s.files,
+                TotalKB: s.totalKB,
+                TotalMB: s.totalMB.toFixed(2),
+                SharingLevel: s.sharingLevel,
+                CopilotReady: s.copilotReady,
+                LastModified: s.lastModified ? s.lastModified.toISOString() : ""
+              }));
+              downloadCSV(exportArr, "filtered_sites.csv");
+            }}
+          >
+            Download CSV
+          </button>
+          
+          <button
+            className="bg-slate-100 hover:bg-slate-200 px-3 py-2 rounded text-sm transition-colors"
+            onClick={() => {
+              const exportJson = siteAgg.sites.map(s => ({
+                siteName: s.siteName,
+                files: s.files,
+                totalKB: s.totalKB,
+                sharingLevel: s.sharingLevel,
+                copilotReady: s.copilotReady
+              }));
+              downloadJSON(exportJson, "site_summary.json");
+            }}
+          >
+            Download JSON
+          </button>
+
+          <button
+            onClick={handleDownloadPdf}
+            disabled={!pdfLibsLoaded || isGeneratingPdf}
+            className={`flex items-center px-3 py-2 rounded text-sm shadow-sm transition-colors ${
+              !pdfLibsLoaded || isGeneratingPdf 
+                ? 'bg-slate-200 text-slate-400 cursor-not-allowed' 
+                : 'bg-indigo-600 hover:bg-indigo-700 text-white'
+            }`}
+          >
+            <Download className="w-4 h-4 mr-2" />
+            {isGeneratingPdf ? 'Generating...' : 'Download PDF'}
+          </button>
+        </div>
+      </header>
+      )}
+
+      {/* SUMMARY CARDS */}
+      <div className="gap-4 mb-6" style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)' }}>
+        <div className="bg-white p-4 rounded shadow-sm text-center">
+          <LayoutDashboard className="mx-auto text-blue-600" />
+          <div className="text-2xl font-bold">{summary.totalSites}</div>
+          <div className="text-sm text-slate-500">Total Unique Sites</div>
+        </div>
+
+        <div className="bg-white p-4 rounded shadow-sm text-center">
+          <ShieldAlert className="mx-auto text-red-600" />
+          <div className="text-2xl font-bold">{summary.publicSites} ({summary.publicPct}%)</div>
+          <div className="text-sm text-slate-500">Sites with Public Access</div>
+        </div>
+
+        <div className="bg-white p-4 rounded shadow-sm text-center">
+          <Database className="mx-auto text-amber-600" />
+          <div className="text-2xl font-bold">{hrBytes(summary.totalMB * 1024)}</div>
+          <div className="text-sm text-slate-500">Total Data Volume</div>
+        </div>
+
+        <div className="bg-white p-4 rounded shadow-sm text-center">
+          <CheckCircle className="mx-auto text-green-600" />
+          <div className="text-2xl font-bold">{summary.readyForCopilot}</div>
+          <div className="text-sm text-slate-500">Sites Ready for Copilot</div>
+        </div>
+      </div>
+
+      <div className="gap-6 mb-6" style={{ display: 'grid', gridTemplateColumns: '2fr 1fr' }}>
+        {/* DATA GRAVITY CHART */}
+        <div className="bg-white p-6 rounded shadow-sm">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="font-bold flex items-center"><FileIcon className="mr-2" /> Data Gravity (Top Sites)</h3>
+            <div className="flex gap-2">
+              <button 
+                onClick={() => setGravityMetric('files')}
+                className={`text-xs px-2 py-1 rounded border ${gravityMetric==='files'?'bg-blue-100 border-blue-300 text-blue-800':'bg-white text-slate-600'}`}
+              >
+                Sort by Files
+              </button>
+              <button 
+                onClick={() => setGravityMetric('size')}
+                className={`text-xs px-2 py-1 rounded border ${gravityMetric==='size'?'bg-blue-100 border-blue-300 text-blue-800':'bg-white text-slate-600'}`}
+              >
+                Sort by Size
+              </button>
+            </div>
+          </div>
+          <p className="text-sm text-slate-500 mb-3">
+            Top sites by {gravityMetric === 'files' ? 'file count' : 'storage size'}. Use toggle above to switch view.
+          </p>
+          <div style={{ height: 320 }}>
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={topHeavy} layout="vertical" margin={{ left: 20 }}>
+                <CartesianGrid strokeDasharray="3 3" horizontal={false} />
+                <XAxis type="number" />
+                <YAxis dataKey="name" type="category" width={180} style={{fontSize: '11px'}} />
+                <Tooltip 
+                  formatter={(value, name, props) => {
+                    if (gravityMetric === 'size') return [props.payload.displaySize, "Size"];
+                    return [value, "Files"];
+                  }}
+                />
+                <Legend />
+                <Bar 
+                  dataKey={gravityMetric === 'files' ? 'files' : 'sizeMB'} 
+                  name={gravityMetric === 'files' ? 'Files' : 'Size (MB)'} 
+                  fill="#3b82f6" 
+                  radius={[0,4,4,0]} 
+                />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+
+        {/* EXPOSURE RISK CHART */}
+        <div className="bg-white p-6 rounded shadow-sm">
+          <h3 className="font-bold mb-3 flex items-center"><Lock className="mr-2" /> Exposure Risk</h3>
+          <p className="text-sm text-slate-500 mb-4">Sites accessible by Everyone / External guests</p>
+          <div style={{ height: 200 }}>
+            <ResponsiveContainer width="100%" height="100%">
+              <PieChart>
+                <Pie data={permissionRisk} dataKey="value" innerRadius={50} outerRadius={80} paddingAngle={4}>
+                  {permissionRisk.map((entry, idx) => <Cell key={idx} fill={entry.color} />)}
+                </Pie>
+                <Tooltip />
+              </PieChart>
+            </ResponsiveContainer>
+          </div>
+          <div className="mt-4 space-y-2">
+            {permissionRisk.map(p => (
+              <div key={p.name} className="flex justify-between text-sm">
+                <div className="flex items-center"><span className="w-3 h-3 rounded-full mr-2" style={{ background: p.color }} />{p.name}</div>
+                <div className="font-semibold">{p.value}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* STALE SITES SECTION (Updated with Expandable Content) */}
+      {staleSitesList.length > 0 && (
+        <div className="mb-6 bg-white p-6 rounded shadow-sm border-l-4 border-amber-500">
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="font-bold text-lg flex items-center text-slate-800">
+              <Clock className="mr-2 text-amber-500" /> Stale Data Analysis ({staleSitesList.length} Sites)
+            </h3>
+            <span className="text-xs font-mono bg-slate-100 px-2 py-1 rounded text-slate-500">
+              Inactive since {summary.staleThreshold.toLocaleDateString()}
+            </span>
+          </div>
+          <p className="text-sm text-slate-600 mb-4">
+            The following sites contain files that have not been modified in the last <strong>5 months</strong>.
+            Click to view the specific stale files within each site.
+          </p>
+          <div className="grid grid-cols-1 gap-2">
+            {staleSitesList.map(site => (
+              <div key={site.siteName} className="border rounded">
+                {/* Collapsible Header */}
+                <button 
+                  className="w-full text-left p-3 bg-slate-50 flex justify-between items-center hover:bg-slate-100 transition-all"
+                  onClick={() => setExpandedStaleSite(expandedStaleSite === site.siteName ? null : site.siteName)}
+                >
+                  <div className="flex items-center overflow-hidden">
+                    {expandedStaleSite === site.siteName ? 
+                      <ChevronDown className="w-4 h-4 mr-2 text-amber-600 flex-shrink-0" /> : 
+                      <ChevronRight className="w-4 h-4 mr-2 text-amber-600 flex-shrink-0" />
+                    }
+                    <div className="font-semibold text-sm truncate text-slate-700" title={site.siteName}>{site.siteName}</div>
+                  </div>
+                  <div className="text-right pl-2 flex-shrink-0">
+                    <div className="text-xs font-bold text-slate-600">{site.staleFileCount} Files</div>
+                    <div className="text-[10px] text-slate-400">Total: {hrBytes(site.staleKB)}</div>
+                  </div>
+                </button>
+
+                {/* Expanded Content (Stale Files Table) */}
+                {expandedStaleSite === site.siteName && (
+                  <div className="p-3 bg-white border-t overflow-x-auto">
+                    <h5 className="font-semibold text-xs mb-2 text-slate-600">
+                      Individual Stale Files ({site.staleFileCount.toLocaleString()} files)
+                    </h5>
+                    <table className="w-full text-xs min-w-[600px]">
+                      <thead className="bg-slate-50">
+                        <tr>
+                          {/* Show a subset of useful columns for files */}
+                          <th className="p-1 text-left">File Path/URL</th>
+                          <th className="p-1 text-left">{lastModKey || 'Last Modified'}</th>
+                          <th className="p-1 text-right">{fileSizeKey || 'Size'}</th>
+                          <th className="p-1 text-left">{copilotKey || 'Copilot Flag'}</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {site.staleFiles.slice(0, 50).map((r, i) => ( // Limit to 50 rows for performance
+                          <tr key={i} className="hover:bg-amber-50/50 border-t">
+                            <td className="p-1 max-w-[250px] truncate" title={r.URL || r.FolderPath || 'N/A'}>{r.URL || r.FolderPath || 'N/A'}</td>
+                            <td className="p-1 whitespace-nowrap text-slate-500">{r[lastModKey] || "—"}</td>
+                            <td className="p-1 text-right whitespace-nowrap">{hrBytes(parseNumber(r[fileSizeKey]))}</td>
+                            <td className="p-1">
+                              {String(r[copilotKey] || "").toLowerCase().includes("ready") 
+                                ? <span className="text-green-600">Ready</span>
+                                : <span className="text-amber-600">Not Ready</span>
+                              }
+                            </td>
+                          </tr>
+                        ))}
+                        {site.staleFileCount > 50 && (
+                          <tr>
+                            <td colSpan={4} className="p-1 text-center text-slate-500 text-xs italic">
+                              ... and {site.staleFileCount - 50} more stale files. Use the site-level download button in the table above for a full list.
+                            </td>
+                          </tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+
+      {/* SITE TABLE */}
+      <div className="mt-6 bg-white p-4 rounded shadow-sm">
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="font-bold">Sites (unique)</h3>
+          <div className="flex items-center gap-2">
+            <input className="border rounded px-2 py-1 text-sm" placeholder="Search site name..." value={filter.search} onChange={(e)=>setFilter({...filter, search: e.target.value})} />
+            <select className="border rounded px-2 py-1 text-sm" value={filter.sharing} onChange={(e)=>setFilter({...filter, sharing: e.target.value})}>
+              <option value="all">All Sharing Levels</option>
+              <option value="Only Org">Only Org</option>
+              <option value="Everyone">Everyone</option>
+              <option value="External (New & Existing)">External (New & Existing)</option>
+              <option value="External (Anonymous)">External (Anonymous)</option>
+            </select>
+          </div>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="text-slate-600 bg-slate-50">
+              <tr>
+                <th className="p-2 text-left cursor-pointer hover:bg-slate-100" onClick={() => setSort({ key: "name", dir: sort.key==='name' && sort.dir==='asc'?'desc':'asc' })}>
+                  Site Name {sort.key === 'name' && <ArrowUpDown className="inline w-3 h-3 ml-1" />}
+                </th>
+                <th className="p-2 text-left cursor-pointer hover:bg-slate-100" onClick={() => setSort({ key: "files", dir: sort.key==='files' && sort.dir==='desc'?'asc':'desc' })}>
+                  Files {sort.key === 'files' && <ArrowUpDown className="inline w-3 h-3 ml-1" />}
+                </th>
+                <th className="p-2 text-left cursor-pointer hover:bg-slate-100" onClick={() => setSort({ key: "kb", dir: sort.key==='kb' && sort.dir==='desc'?'asc':'desc' })}>
+                  Storage {sort.key === 'kb' && <ArrowUpDown className="inline w-3 h-3 ml-1" />}
+                </th>
+                <th className="p-2 text-left">Sharing</th>
+                <th className="p-2 text-left">Copilot</th>
+                <th className="p-2 text-left cursor-pointer hover:bg-slate-100" onClick={() => setSort({ key: "last", dir: sort.key==='last' && sort.dir==='desc'?'asc':'desc' })}>
+                  Last Modified {sort.key === 'last' && <ArrowUpDown className="inline w-3 h-3 ml-1" />}
+                </th>
+                <th className="p-2 text-left">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filteredSites.map(s => (
+                <tr key={s.siteName} className="hover:bg-slate-50">
+                  <td className="p-2">{s.siteName}</td>
+                  <td className="p-2">{s.files.toLocaleString()}</td>
+                  <td className="p-2">{hrBytes(s.totalKB)}</td>
+                  <td className="p-2">{s.sharingLevel}</td>
+                  <td className="p-2">{s.copilotReady ? <span className="text-green-600 font-semibold">Ready</span> : <span className="text-amber-600">Not Ready</span>}</td>
+                  <td className="p-2">{s.lastModified ? s.lastModified.toISOString().split("T")[0] : "—"}</td>
+                  <td className="p-2">
+                    <button className="px-2 py-1 bg-slate-100 rounded text-xs" onClick={()=>setExpandedSite(expandedSite===s.siteName?null:s.siteName)}>
+                      {expandedSite===s.siteName ? "Collapse" : "Expand"}
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        {/* expanded detail */}
+        {expandedSite && (() => {
+          const site = siteAgg.sites.find(x => x.siteName === expandedSite);
+          if (!site) return null;
+          return (
+            <div className="mt-4 p-4 bg-slate-50 rounded">
+              <div className="flex items-center justify-between mb-3">
+                <h4 className="font-semibold">Details for: {site.siteName}</h4>
+                <div>
+                  <button className="px-2 py-1 bg-slate-100 rounded text-sm mr-2" onClick={() => downloadJSON(site.rawRows, `${site.siteName}_rows.json`)}>Download Rows (JSON)</button>
+                  <button className="px-2 py-1 bg-slate-100 rounded text-sm" onClick={() => downloadCSV(site.rawRows, `${site.siteName}_rows.csv`)}>Download Rows (CSV)</button>
+                </div>
+              </div>
+
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead className="bg-white text-slate-600">
+                    <tr>
+                      {headers.map(h => <th key={h} className="p-2 text-left">{h}</th>)}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {site.rawRows.map((r, i) => (
+                      <tr key={i} className="odd:bg-transparent even:bg-slate-50">
+                        {headers.map(h => <td key={h} className="p-2 align-top">{String(r[h] ?? "")}</td>)}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          );
+        })()}
+
+      </div>
+
+      {!hideFooter && (
+      <footer className="mt-6 text-sm text-slate-500">
+        <div>Detected site column: <strong>{siteKey || "(none)"}</strong> &nbsp; | &nbsp; FileCount column: <strong>{fileCountKey || "(none)"}</strong> &nbsp; | &nbsp; FileSize column: <strong>{fileSizeKey || "(none)"}</strong> &nbsp; | &nbsp; LastModified column: <strong>{lastModKey || "(none)"}</strong></div>
+        <div className="mt-2">Tip: If the component guessed wrong fields, re-upload a CSV with explicit headers like <em>SiteName,SiteFileCount,FileSize,LastModifiedDate,CopilotReadinessFlag</em>.</div>
+      </footer>
+      )}
+    </div>
+  );
+}
+

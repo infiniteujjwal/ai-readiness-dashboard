@@ -1,0 +1,21 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Custom grid utilities for dashboard */
+@media (min-width: 768px) {
+  .summary-grid {
+    display: grid !important;
+    grid-template-columns: repeat(4, minmax(0, 1fr)) !important;
+  }
+  
+  .charts-grid {
+    display: grid !important;
+    grid-template-columns: repeat(3, minmax(0, 1fr)) !important;
+  }
+  
+  .chart-span-2 {
+    grid-column: span 2 / span 2 !important;
+  }
+}
+
