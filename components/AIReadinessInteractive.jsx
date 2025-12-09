@@ -11,7 +11,7 @@ import {
 import {
   ShieldAlert, CheckCircle, Database, LayoutDashboard, FileText,
   Lock, Users, AlertTriangle, ChevronRight, FileText as FileIcon,
-  Clock, ArrowUpDown, Download, ChevronDown
+  Clock, ArrowUpDown, Download, ChevronDown, Filter
 } from "lucide-react";
 
 /*
@@ -23,15 +23,18 @@ import {
   - Sorting and filtering on site table
   - Sharing-level classification (refined heuristics)
   - Staleness calculation by LastModifiedDate
-  - Copilot readiness detection via CopilotReadinessFlag or similar
   - All charts update reactively when CSV changes
   
   UPDATES:
   - Added 'gravityMetric' toggle to sort Top Sites by File Count OR Storage Size.
   - Added 'Stale Content' section with expandable list to show individual stale files.
+  - Added File Type filtering and visualization.
+  - Removed Copilot readiness features.
 */
 
 /* ---------- Utilities ---------- */
+const COLORS = ['#0088FE', '#00C49F', '#FFBB28', '#FF8042', '#8884d8', '#82ca9d', '#ffc658', '#8dd1e1', '#a4de6c', '#d0ed57'];
+
 const hrBytes = (kb) => {
   if (!Number.isFinite(kb)) return "0 KB";
   const mb = kb / 1024;
@@ -153,9 +156,12 @@ export default function AIReadinessInteractive({
   const [fileCountKey, setFileCountKey] = useState(null);
   const [fileSizeKey, setFileSizeKey] = useState(null);
   const [lastModKey, setLastModKey] = useState(null);
-  const [copilotKey, setCopilotKey] = useState(null);
+  const [fileTypeKey, setFileTypeKey] = useState(null);
+  const [fileNameKey, setFileNameKey] = useState(null);
   
   const [filter, setFilter] = useState({ search: "", sharing: "all" });
+  const [fileTypeFilter, setFileTypeFilter] = useState("All");
+
   const [sort, setSort] = useState({ key: "files", dir: "desc" });
   const [expandedSite, setExpandedSite] = useState(null);
   // New state for toggling stale site details
@@ -167,6 +173,39 @@ export default function AIReadinessInteractive({
   // PDF Generation State
   const [pdfLibsLoaded, setPdfLibsLoaded] = useState(false);
   const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
+
+  // Helper to update state with found column keys
+  const updateColumnKeys = useCallback((hdrs) => {
+    setHeaders(hdrs);
+    
+    setSiteKey(guessSiteColumn(hdrs));
+    setFileCountKey(findColumns(hdrs, ["filecount", "sitefilecount", "itemcount", "documentcount", "count"]));
+    setFileSizeKey(findColumns(hdrs, ["filesize", "file_size", "size", "storageusage"]));
+    setLastModKey(findColumns(hdrs, ["lastmodified", "modified", "lastmodifieddate"]));
+    
+    // New keys for file type detection
+    setFileTypeKey(findColumns(hdrs, ["extension", "filetype", "file_type", "type", "docicon", "itemtype"]));
+    setFileNameKey(findColumns(hdrs, ["filename", "file_name", "name", "itemname", "url", "path", "link"]));
+  }, []);
+
+  // Helper to extract file extension
+  const getFileExtension = useCallback((row) => {
+    let val = "";
+    if (fileTypeKey && row[fileTypeKey]) {
+      val = row[fileTypeKey];
+    } else if (fileNameKey && row[fileNameKey]) {
+      const name = row[fileNameKey];
+      const parts = name.split('.');
+      if (parts.length > 1) {
+        const lastPart = parts.pop();
+        val = lastPart.split(/[?#]/)[0]; // Remove query params
+      }
+    }
+    if (!val) return "unknown";
+    const clean = String(val).toLowerCase().trim().replace(/^\./, '');
+    // Basic validation: extensions are usually short. If > 10 chars, probably not an extension.
+    return (clean.length > 0 && clean.length < 10) ? clean : "unknown";
+  }, [fileTypeKey, fileNameKey]);
 
   // PostMessage communication for embedded mode
   useEffect(() => {
@@ -190,14 +229,8 @@ export default function AIReadinessInteractive({
               const parsedData = res.data || [];
               setRows(parsedData);
               const hdrs = res.meta.fields || (parsedData.length ? Object.keys(parsedData[0]) : []);
-              setHeaders(hdrs);
               
-              const guessedSite = guessSiteColumn(hdrs);
-              setSiteKey(guessedSite);
-              setFileCountKey(findColumns(hdrs, ["filecount", "sitefilecount", "itemcount", "documentcount", "count"]));
-              setFileSizeKey(findColumns(hdrs, ["filesize", "file_size", "size", "storageusage"]));
-              setLastModKey(findColumns(hdrs, ["lastmodified", "modified", "lastmodifieddate"]));
-              setCopilotKey(findColumns(hdrs, ["copilot", "copilotreadiness", "copilot_readiness", "copilot_readiness_flag"]));
+              updateColumnKeys(hdrs);
               
               // Notify parent of successful load
               window.parent.postMessage({ 
@@ -217,7 +250,7 @@ export default function AIReadinessInteractive({
 
     window.addEventListener('message', handleMessage);
     return () => window.removeEventListener('message', handleMessage);
-  }, [isEmbedded]);
+  }, [isEmbedded, updateColumnKeys]);
 
   // Load PDF libraries from CDN on mount
   useEffect(() => {
@@ -301,35 +334,62 @@ export default function AIReadinessInteractive({
         setRawCsv(null);
         setRows(data);
         const hdrs = res.meta.fields || (data.length ? Object.keys(data[0]) : []);
-        setHeaders(hdrs);
-        
-        const guessedSite = guessSiteColumn(hdrs);
-        setSiteKey(guessedSite);
-
-        const fc = findColumns(hdrs, ["filecount", "sitefilecount", "itemcount", "documentcount", "count"]);
-        setFileCountKey(fc);
-
-        const fs = findColumns(hdrs, ["filesize", "file_size", "size", "storageusage"]);
-        setFileSizeKey(fs);
-
-        const lm = findColumns(hdrs, ["lastmodified", "modified", "lastmodifieddate", "lastmodifieddate"]);
-        setLastModKey(lm);
-
-        const cop = findColumns(hdrs, ["copilot", "copilotreadiness", "copilot_readiness", "copilot_readiness_flag"]);
-        setCopilotKey(cop);
+        updateColumnKeys(hdrs);
       } catch (err) {
         console.error("CSV parse error", err);
       }
     };
     reader.readAsText(file);
-  }, []);
+  }, [updateColumnKeys]);
+
+  // ---------- derived rows (filtered by file type) ----------
+  const filteredRows = useMemo(() => {
+    if (!rows || !rows.length) return [];
+    if (fileTypeFilter === "All") return rows;
+    return rows.filter(r => getFileExtension(r) === fileTypeFilter);
+  }, [rows, fileTypeFilter, getFileExtension]);
+
+  // ---------- file type statistics for Pie Chart and Dropdown ----------
+  const { fileTypeStats, allFileTypes } = useMemo(() => {
+    if (!rows || !rows.length) return { fileTypeStats: [], allFileTypes: [] };
+    
+    // For the dropdown, we want ALL available types
+    const typesSet = new Set();
+    // For the chart, we want the distribution of the CURRENT filtered view
+    const distribution = {};
+
+    filteredRows.forEach(r => {
+      const ext = getFileExtension(r);
+      distribution[ext] = (distribution[ext] || 0) + 1;
+    });
+
+    rows.forEach(r => {
+      const ext = getFileExtension(r);
+      typesSet.add(ext);
+    });
+
+    const stats = Object.entries(distribution)
+      .map(([name, value]) => ({ name, value }))
+      .sort((a,b) => b.value - a.value);
+    
+    // Group small slices into "Other" if too many
+    let chartData = stats.slice(0, 8);
+    const others = stats.slice(8).reduce((acc, curr) => acc + curr.value, 0);
+    if (others > 0) {
+      chartData.push({ name: "Other", value: others });
+    }
+
+    const sortedTypes = Array.from(typesSet).sort();
+    
+    return { fileTypeStats: chartData, allFileTypes: sortedTypes };
+  }, [rows, filteredRows, getFileExtension]);
 
   // ---------- derived site-level aggregation ----------
   const siteAgg = useMemo(() => {
-    if (!rows || !rows.length || !siteKey) return { sites: [], maps: {} };
+    if (!filteredRows || !filteredRows.length || !siteKey) return { sites: [], maps: {} };
 
     const map = new Map();
-    for (const r of rows) {
+    for (const r of filteredRows) {
       const s = (r[siteKey] || "(unknown)").trim();
       if (!map.has(s)) map.set(s, []);
       map.get(s).push(r);
@@ -360,11 +420,6 @@ export default function AIReadinessInteractive({
       }).filter(Boolean);
       const lastModified = lastDates.length ? new Date(Math.max(...lastDates.map(d => d.getTime()))) : null;
 
-      let copilotReady = false;
-      if (copilotKey) {
-        copilotReady = siteRows.some(r => String(r[copilotKey] || "").toLowerCase().includes("ready"));
-      }
-
       const visibleEveryone = /\beveryone\b/i.test(combinedText);
       const visibleExternal = /\b(external|guest|anon|anyone)\b/i.test(combinedText);
 
@@ -376,7 +431,6 @@ export default function AIReadinessInteractive({
         totalMB: totalKB / 1024,
         totalGB: (totalKB / 1024) / 1024,
         lastModified,
-        copilotReady,
         sharingLevel: sharing.level,
         sharingRank: sharing.rank,
         visibleEveryone,
@@ -388,7 +442,7 @@ export default function AIReadinessInteractive({
     sites.sort((a,b) => b.files - a.files);
     const maps = { byName: map };
     return { sites, maps };
-  }, [rows, siteKey, fileCountKey, fileSizeKey, lastModKey, copilotKey]);
+  }, [filteredRows, siteKey, fileCountKey, fileSizeKey, lastModKey]);
 
   // ---------- computed summary metrics ----------
   const summary = useMemo(() => {
@@ -397,7 +451,6 @@ export default function AIReadinessInteractive({
     const everyoneSites = siteAgg.sites.filter(s => s.visibleEveryone || s.visibleExternal).length;
     const totalKB = siteAgg.sites.reduce((acc,s) => acc + (s.totalKB || 0), 0);
     const totalFiles = siteAgg.sites.reduce((acc,s) => acc + (s.files || 0), 0);
-    const readyForCopilot = siteAgg.sites.filter(s => s.copilotReady).length;
     
     // Stale = older than 5 months (approx 150 days)
     const staleThreshold = new Date();
@@ -416,7 +469,6 @@ export default function AIReadinessInteractive({
       totalMB: totalKB/1024,
       totalGB: (totalKB/1024)/1024,
       totalFiles,
-      readyForCopilot,
       staleThreshold // Keep this for use in staleSitesList
     };
   }, [siteAgg]);
@@ -569,7 +621,6 @@ export default function AIReadinessInteractive({
                 TotalKB: s.totalKB,
                 TotalMB: s.totalMB.toFixed(2),
                 SharingLevel: s.sharingLevel,
-                CopilotReady: s.copilotReady,
                 LastModified: s.lastModified ? s.lastModified.toISOString() : ""
               }));
               downloadCSV(exportArr, "filtered_sites.csv");
@@ -585,8 +636,7 @@ export default function AIReadinessInteractive({
                 siteName: s.siteName,
                 files: s.files,
                 totalKB: s.totalKB,
-                sharingLevel: s.sharingLevel,
-                copilotReady: s.copilotReady
+                sharingLevel: s.sharingLevel
               }));
               downloadJSON(exportJson, "site_summary.json");
             }}
@@ -610,8 +660,37 @@ export default function AIReadinessInteractive({
       </header>
       )}
 
+      {/* GLOBAL FILTERS */}
+      <div className="mb-6 flex items-center gap-4 bg-white p-4 rounded shadow-sm flex-wrap">
+        <div className="flex items-center gap-2">
+           <Filter className="w-5 h-5 text-slate-500" />
+           <span className="font-semibold text-slate-700">Global Filters:</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <label className="text-sm text-slate-600">File Type:</label>
+          <select 
+            className="border rounded px-2 py-1 text-sm bg-slate-50 min-w-[150px]"
+            value={fileTypeFilter}
+            onChange={(e) => setFileTypeFilter(e.target.value)}
+          >
+            <option value="All">All Types ({allFileTypes.length})</option>
+            {allFileTypes.map(t => (
+              <option key={t} value={t}>{t}</option>
+            ))}
+          </select>
+        </div>
+        {fileTypeFilter !== "All" && (
+           <button 
+             onClick={() => setFileTypeFilter("All")}
+             className="text-xs text-blue-600 hover:underline"
+           >
+             Reset
+           </button>
+        )}
+      </div>
+
       {/* SUMMARY CARDS */}
-      <div className="gap-4 mb-6" style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)' }}>
+      <div className="gap-4 mb-6" style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)' }}>
         <div className="bg-white p-4 rounded shadow-sm text-center">
           <LayoutDashboard className="mx-auto text-blue-600" />
           <div className="text-2xl font-bold">{summary.totalSites}</div>
@@ -629,15 +708,9 @@ export default function AIReadinessInteractive({
           <div className="text-2xl font-bold">{hrBytes(summary.totalMB * 1024)}</div>
           <div className="text-sm text-slate-500">Total Data Volume</div>
         </div>
-
-        <div className="bg-white p-4 rounded shadow-sm text-center">
-          <CheckCircle className="mx-auto text-green-600" />
-          <div className="text-2xl font-bold">{summary.readyForCopilot}</div>
-          <div className="text-sm text-slate-500">Sites Ready for Copilot</div>
-        </div>
       </div>
 
-      <div className="gap-6 mb-6" style={{ display: 'grid', gridTemplateColumns: '2fr 1fr' }}>
+      <div className="gap-6 mb-6" style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1fr' }}>
         {/* DATA GRAVITY CHART */}
         <div className="bg-white p-6 rounded shadow-sm">
           <div className="flex items-center justify-between mb-3">
@@ -707,6 +780,33 @@ export default function AIReadinessInteractive({
             ))}
           </div>
         </div>
+
+        {/* FILE TYPE CHART */}
+        <div className="bg-white p-6 rounded shadow-sm">
+          <h3 className="font-bold mb-3 flex items-center"><FileIcon className="mr-2" /> File Types</h3>
+          <p className="text-sm text-slate-500 mb-4">Distribution by type</p>
+          <div style={{ height: 200 }}>
+            <ResponsiveContainer width="100%" height="100%">
+              <PieChart>
+                <Pie data={fileTypeStats} dataKey="value" innerRadius={40} outerRadius={70} paddingAngle={2}>
+                  {fileTypeStats.map((entry, idx) => <Cell key={idx} fill={COLORS[idx % COLORS.length]} />)}
+                </Pie>
+                <Tooltip />
+              </PieChart>
+            </ResponsiveContainer>
+          </div>
+          <div className="mt-4 space-y-1 h-[100px] overflow-y-auto pr-1 custom-scrollbar">
+            {fileTypeStats.map((p, idx) => (
+              <div key={p.name} className="flex justify-between text-xs">
+                <div className="flex items-center">
+                  <span className="w-2 h-2 rounded-full mr-2" style={{ background: COLORS[idx % COLORS.length] }} />
+                  <span className="truncate max-w-[100px]" title={p.name}>{p.name}</span>
+                </div>
+                <div className="font-semibold">{p.value}</div>
+              </div>
+            ))}
+          </div>
+        </div>
       </div>
 
       {/* STALE SITES SECTION (Updated with Expandable Content) */}
@@ -758,7 +858,6 @@ export default function AIReadinessInteractive({
                           <th className="p-1 text-left">File Path/URL</th>
                           <th className="p-1 text-left">{lastModKey || 'Last Modified'}</th>
                           <th className="p-1 text-right">{fileSizeKey || 'Size'}</th>
-                          <th className="p-1 text-left">{copilotKey || 'Copilot Flag'}</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -767,17 +866,11 @@ export default function AIReadinessInteractive({
                             <td className="p-1 max-w-[250px] truncate" title={r.URL || r.FolderPath || 'N/A'}>{r.URL || r.FolderPath || 'N/A'}</td>
                             <td className="p-1 whitespace-nowrap text-slate-500">{r[lastModKey] || "—"}</td>
                             <td className="p-1 text-right whitespace-nowrap">{hrBytes(parseNumber(r[fileSizeKey]))}</td>
-                            <td className="p-1">
-                              {String(r[copilotKey] || "").toLowerCase().includes("ready") 
-                                ? <span className="text-green-600">Ready</span>
-                                : <span className="text-amber-600">Not Ready</span>
-                              }
-                            </td>
                           </tr>
                         ))}
                         {site.staleFileCount > 50 && (
                           <tr>
-                            <td colSpan={4} className="p-1 text-center text-slate-500 text-xs italic">
+                            <td colSpan={3} className="p-1 text-center text-slate-500 text-xs italic">
                               ... and {site.staleFileCount - 50} more stale files. Use the site-level download button in the table above for a full list.
                             </td>
                           </tr>
@@ -823,7 +916,6 @@ export default function AIReadinessInteractive({
                   Storage {sort.key === 'kb' && <ArrowUpDown className="inline w-3 h-3 ml-1" />}
                 </th>
                 <th className="p-2 text-left">Sharing</th>
-                <th className="p-2 text-left">Copilot</th>
                 <th className="p-2 text-left cursor-pointer hover:bg-slate-100" onClick={() => setSort({ key: "last", dir: sort.key==='last' && sort.dir==='desc'?'asc':'desc' })}>
                   Last Modified {sort.key === 'last' && <ArrowUpDown className="inline w-3 h-3 ml-1" />}
                 </th>
@@ -837,7 +929,6 @@ export default function AIReadinessInteractive({
                   <td className="p-2">{s.files.toLocaleString()}</td>
                   <td className="p-2">{hrBytes(s.totalKB)}</td>
                   <td className="p-2">{s.sharingLevel}</td>
-                  <td className="p-2">{s.copilotReady ? <span className="text-green-600 font-semibold">Ready</span> : <span className="text-amber-600">Not Ready</span>}</td>
                   <td className="p-2">{s.lastModified ? s.lastModified.toISOString().split("T")[0] : "—"}</td>
                   <td className="p-2">
                     <button className="px-2 py-1 bg-slate-100 rounded text-xs" onClick={()=>setExpandedSite(expandedSite===s.siteName?null:s.siteName)}>
@@ -889,7 +980,7 @@ export default function AIReadinessInteractive({
       {!hideFooter && (
       <footer className="mt-6 text-sm text-slate-500">
         <div>Detected site column: <strong>{siteKey || "(none)"}</strong> &nbsp; | &nbsp; FileCount column: <strong>{fileCountKey || "(none)"}</strong> &nbsp; | &nbsp; FileSize column: <strong>{fileSizeKey || "(none)"}</strong> &nbsp; | &nbsp; LastModified column: <strong>{lastModKey || "(none)"}</strong></div>
-        <div className="mt-2">Tip: If the component guessed wrong fields, re-upload a CSV with explicit headers like <em>SiteName,SiteFileCount,FileSize,LastModifiedDate,CopilotReadinessFlag</em>.</div>
+        <div className="mt-2">Tip: If the component guessed wrong fields, re-upload a CSV with explicit headers like <em>SiteName,SiteFileCount,FileSize,LastModifiedDate</em>.</div>
       </footer>
       )}
     </div>
