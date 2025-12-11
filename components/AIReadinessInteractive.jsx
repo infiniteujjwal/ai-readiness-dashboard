@@ -30,10 +30,66 @@ import {
   - Added 'Stale Content' section with expandable list to show individual stale files.
   - Added File Type filtering and visualization.
   - Removed Copilot readiness features.
+  - Added 'Risk Profile' global filter based on permission groups.
 */
 
 /* ---------- Utilities ---------- */
 const COLORS = ['#0088FE', '#00C49F', '#FFBB28', '#FF8042', '#8884d8', '#82ca9d', '#ffc658', '#8dd1e1', '#a4de6c', '#d0ed57'];
+
+// Risk Classification Logic
+const getRiskProfile = (text) => {
+  const t = (text || "").toLowerCase();
+  
+  // Group 1: The "Kill Switch" Risks (Critical)
+  if (/\beveryone\b/.test(t) || t.includes("everyone except external users")) {
+    return "Critical";
+  }
+
+  // Group 2: The "Blind Spots" (Medium Risk)
+  if (
+    t.includes("visitor") || // Matches Visitor, Visitors, Project Web App Visitors
+    t.includes("excel services viewers") || 
+    t.includes("portfolio viewers")
+  ) {
+    return "Medium";
+  }
+
+  // Group 3: The "Safe" Zone (Low Risk)
+  if (
+    t.includes("owner") ||  // Matches Owner, Owners
+    t.includes("member") || // Matches Member, Members
+    t.includes("administrator") || 
+    t.includes("project manager") || 
+    t.includes("team lead") || 
+    t.includes("resource manager")
+  ) {
+    return "Low";
+  }
+
+  return "Unknown";
+};
+
+// Content Category Logic
+const getContentCategory = (ext) => {
+  const e = (ext || "").toLowerCase().trim().replace(/^\./, '');
+  
+  // Group A — High-Value Business Content
+  if (["doc", "docx", "pdf", "xlsx", "xls", "ppt", "pptx", "folder"].includes(e)) {
+    return "Business";
+  }
+  
+  // Group B — Operational / System Files
+  if (["aspx", "odc", "n/a", "unknown", ""].includes(e)) {
+    return "System";
+  }
+  
+  // Group C — Media Files
+  if (["jpg", "jpeg", "png", "gif", "mp4", "mp3", "wav", "mov"].includes(e)) {
+    return "Media";
+  }
+  
+  return "Other";
+};
 
 const hrBytes = (kb) => {
   if (!Number.isFinite(kb)) return "0 KB";
@@ -158,9 +214,13 @@ export default function AIReadinessInteractive({
   const [lastModKey, setLastModKey] = useState(null);
   const [fileTypeKey, setFileTypeKey] = useState(null);
   const [fileNameKey, setFileNameKey] = useState(null);
+  const [permKey, setPermKey] = useState(null);
   
   const [filter, setFilter] = useState({ search: "", sharing: "all" });
   const [fileTypeFilter, setFileTypeFilter] = useState("All");
+  const [riskFilter, setRiskFilter] = useState("All");
+  const [categoryFilter, setCategoryFilter] = useState("All");
+  const [stalePeriod, setStalePeriod] = useState("6months"); // Default to 6 months
 
   const [sort, setSort] = useState({ key: "files", dir: "desc" });
   const [expandedSite, setExpandedSite] = useState(null);
@@ -186,7 +246,46 @@ export default function AIReadinessInteractive({
     // New keys for file type detection
     setFileTypeKey(findColumns(hdrs, ["extension", "filetype", "file_type", "type", "docicon", "itemtype"]));
     setFileNameKey(findColumns(hdrs, ["filename", "file_name", "name", "itemname", "url", "path", "link"]));
+    
+    // Permission/Group column detection
+    setPermKey(findColumns(hdrs, ["permissions", "perm", "usergroup", "group", "sharedwith", "access", "sharing"]));
   }, []);
+
+  // Helper to calculate stale threshold based on period
+  const getStaleThreshold = useCallback((period) => {
+    const now = new Date();
+    const threshold = new Date(now);
+    
+    switch(period) {
+      case "6months":
+        threshold.setMonth(threshold.getMonth() - 6);
+        break;
+      case "12months":
+        threshold.setMonth(threshold.getMonth() - 12);
+        break;
+      case "2years":
+        threshold.setFullYear(threshold.getFullYear() - 2);
+        break;
+      case "5years":
+        threshold.setFullYear(threshold.getFullYear() - 5);
+        break;
+      default:
+        threshold.setMonth(threshold.getMonth() - 6);
+    }
+    
+    return threshold;
+  }, []);
+
+  // Helper to get period label
+  const getPeriodLabel = (period) => {
+    switch(period) {
+      case "6months": return "Last 6 Months";
+      case "12months": return "Last 12 Months";
+      case "2years": return "Last 2 Years";
+      case "5years": return "Last 5 Years";
+      default: return "Last 6 Months";
+    }
+  };
 
   // Helper to extract file extension
   const getFileExtension = useCallback((row) => {
@@ -195,7 +294,9 @@ export default function AIReadinessInteractive({
       val = row[fileTypeKey];
     } else if (fileNameKey && row[fileNameKey]) {
       const name = row[fileNameKey];
-      const parts = name.split('.');
+      // Handle URLs or paths by taking the last segment
+      const lastSegment = name.split('/').pop();
+      const parts = lastSegment.split('.');
       if (parts.length > 1) {
         const lastPart = parts.pop();
         val = lastPart.split(/[?#]/)[0]; // Remove query params
@@ -342,12 +443,40 @@ export default function AIReadinessInteractive({
     reader.readAsText(file);
   }, [updateColumnKeys]);
 
-  // ---------- derived rows (filtered by file type) ----------
+  // ---------- derived rows (filtered by file type & risk profile) ----------
   const filteredRows = useMemo(() => {
     if (!rows || !rows.length) return [];
-    if (fileTypeFilter === "All") return rows;
-    return rows.filter(r => getFileExtension(r) === fileTypeFilter);
-  }, [rows, fileTypeFilter, getFileExtension]);
+    
+    return rows.filter(r => {
+      // 1. File Type Filter
+      if (fileTypeFilter !== "All") {
+        if (getFileExtension(r) !== fileTypeFilter) return false;
+      }
+      
+      // 2. Risk Profile Filter
+      if (riskFilter !== "All") {
+        // ALWAYS search the full row for risk keywords to ensure we don't miss 
+        // group info that might be in unexpected columns (Description, Name, etc.)
+        // This mirrors the robust logic used in site-level classification.
+        const textToCheck = Object.values(r).join(" ");
+        
+        const risk = getRiskProfile(textToCheck);
+        
+        if (riskFilter === "Critical" && risk !== "Critical") return false;
+        if (riskFilter === "Medium" && risk !== "Medium") return false;
+        if (riskFilter === "Low" && risk !== "Low") return false;
+      }
+      
+      // 3. Content Category Filter
+      if (categoryFilter !== "All") {
+        const ext = getFileExtension(r);
+        const cat = getContentCategory(ext);
+        if (cat !== categoryFilter) return false;
+      }
+
+      return true;
+    });
+  }, [rows, fileTypeFilter, riskFilter, categoryFilter, getFileExtension]);
 
   // ---------- file type statistics for Pie Chart and Dropdown ----------
   const { fileTypeStats, allFileTypes } = useMemo(() => {
@@ -452,12 +581,8 @@ export default function AIReadinessInteractive({
     const totalKB = siteAgg.sites.reduce((acc,s) => acc + (s.totalKB || 0), 0);
     const totalFiles = siteAgg.sites.reduce((acc,s) => acc + (s.files || 0), 0);
     
-    // Stale = older than 5 months (approx 150 days)
-    const staleThreshold = new Date();
-    staleThreshold.setDate(staleThreshold.getDate() - 150);
-    
-    // Stale site count is calculated in staleSitesList below, but we keep the threshold here
-    // for consistency.
+    // Calculate stale threshold based on selected period
+    const staleThreshold = getStaleThreshold(stalePeriod);
     
     return {
       totalSites,
@@ -471,7 +596,7 @@ export default function AIReadinessInteractive({
       totalFiles,
       staleThreshold // Keep this for use in staleSitesList
     };
-  }, [siteAgg]);
+  }, [siteAgg, stalePeriod, getStaleThreshold]);
 
   // ---------- stale sites list (now includes stale files) ----------
   const staleSitesList = useMemo(() => {
@@ -528,23 +653,6 @@ export default function AIReadinessInteractive({
       risk: s.files > 10000 ? "Critical" : (s.files > 1000 ? "High" : (s.files > 500 ? "Medium" : "Low"))
     }));
   }, [siteAgg.sites, gravityMetric]);
-
-  // ---------- permission risk data (unchanged) ----------
-  const permissionRisk = useMemo(() => {
-    const uniquePermCol = headers.find(h => /unique|hasuniqu|uniqueperm/i.test(h));
-    const hasUnique = uniquePermCol ? siteAgg.sites.filter(s => {
-      return s.rawRows.some(rr => String(rr[uniquePermCol] || "").toLowerCase() === "true");
-    }).length : siteAgg.sites.length;
-
-    const inheritedClean = Math.max(0, siteAgg.sites.length - hasUnique);
-    const publicCount = siteAgg.sites.filter(s => s.sharingLevel === "External (Anonymous)" || s.visibleEveryone).length;
-
-    return [
-      { name: 'Unique Permissions', value: hasUnique, color: '#6366f1' },
-      { name: 'Inherited (Clean)', value: inheritedClean, color: '#10b981' },
-      { name: 'Public / Everyone', value: publicCount, color: '#ef4444' }
-    ];
-  }, [siteAgg, headers]);
 
   // ---------- filters & sorting for site table (unique sites) ----------
   const filteredSites = useMemo(() => {
@@ -679,12 +787,46 @@ export default function AIReadinessInteractive({
             ))}
           </select>
         </div>
-        {fileTypeFilter !== "All" && (
+
+        <div className="flex items-center gap-2 border-l pl-4 ml-2">
+          <label className="text-sm text-slate-600">Risk Profile:</label>
+          <select 
+            className="border rounded px-2 py-1 text-sm bg-slate-50 min-w-[150px]"
+            value={riskFilter}
+            onChange={(e) => setRiskFilter(e.target.value)}
+          >
+            <option value="All">All Risks</option>
+            <option value="Critical">Kill Switch (Critical)</option>
+            <option value="Medium">Blind Spots (Medium)</option>
+            <option value="Low">Safe Zone (Low)</option>
+          </select>
+        </div>
+
+        <div className="flex items-center gap-2 border-l pl-4 ml-2">
+          <label className="text-sm text-slate-600">Content:</label>
+          <select 
+            className="border rounded px-2 py-1 text-sm bg-slate-50 min-w-[150px]"
+            value={categoryFilter}
+            onChange={(e) => setCategoryFilter(e.target.value)}
+          >
+            <option value="All">All Content</option>
+            <option value="Business">Business (High Value)</option>
+            <option value="System">System (Low Value)</option>
+            <option value="Media">Media (Not Relevant)</option>
+            <option value="Other">Other</option>
+          </select>
+        </div>
+
+        {(fileTypeFilter !== "All" || riskFilter !== "All" || categoryFilter !== "All") && (
            <button 
-             onClick={() => setFileTypeFilter("All")}
+             onClick={() => {
+               setFileTypeFilter("All");
+               setRiskFilter("All");
+               setCategoryFilter("All");
+             }}
              className="text-xs text-blue-600 hover:underline"
            >
-             Reset
+             Reset Filters
            </button>
         )}
       </div>
@@ -710,7 +852,7 @@ export default function AIReadinessInteractive({
         </div>
       </div>
 
-      <div className="gap-6 mb-6" style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1fr' }}>
+      <div className="gap-6 mb-6" style={{ display: 'grid', gridTemplateColumns: '2fr 1fr' }}>
         {/* DATA GRAVITY CHART */}
         <div className="bg-white p-6 rounded shadow-sm">
           <div className="flex items-center justify-between mb-3">
@@ -757,30 +899,6 @@ export default function AIReadinessInteractive({
           </div>
         </div>
 
-        {/* EXPOSURE RISK CHART */}
-        <div className="bg-white p-6 rounded shadow-sm">
-          <h3 className="font-bold mb-3 flex items-center"><Lock className="mr-2" /> Exposure Risk</h3>
-          <p className="text-sm text-slate-500 mb-4">Sites accessible by Everyone / External guests</p>
-          <div style={{ height: 200 }}>
-            <ResponsiveContainer width="100%" height="100%">
-              <PieChart>
-                <Pie data={permissionRisk} dataKey="value" innerRadius={50} outerRadius={80} paddingAngle={4}>
-                  {permissionRisk.map((entry, idx) => <Cell key={idx} fill={entry.color} />)}
-                </Pie>
-                <Tooltip />
-              </PieChart>
-            </ResponsiveContainer>
-          </div>
-          <div className="mt-4 space-y-2">
-            {permissionRisk.map(p => (
-              <div key={p.name} className="flex justify-between text-sm">
-                <div className="flex items-center"><span className="w-3 h-3 rounded-full mr-2" style={{ background: p.color }} />{p.name}</div>
-                <div className="font-semibold">{p.value}</div>
-              </div>
-            ))}
-          </div>
-        </div>
-
         {/* FILE TYPE CHART */}
         <div className="bg-white p-6 rounded shadow-sm">
           <h3 className="font-bold mb-3 flex items-center"><FileIcon className="mr-2" /> File Types</h3>
@@ -812,16 +930,26 @@ export default function AIReadinessInteractive({
       {/* STALE SITES SECTION (Updated with Expandable Content) */}
       {staleSitesList.length > 0 && (
         <div className="mb-6 bg-white p-6 rounded shadow-sm border-l-4 border-amber-500">
-          <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
             <h3 className="font-bold text-lg flex items-center text-slate-800">
               <Clock className="mr-2 text-amber-500" /> Stale Data Analysis ({staleSitesList.length} Sites)
             </h3>
-            <span className="text-xs font-mono bg-slate-100 px-2 py-1 rounded text-slate-500">
-              Inactive since {summary.staleThreshold.toLocaleDateString()}
-            </span>
+            <div className="flex items-center gap-2">
+              <label className="text-xs text-slate-600">Inactive since:</label>
+              <select 
+                className="text-xs border rounded px-2 py-1 bg-slate-50 text-slate-700 min-w-[140px]"
+                value={stalePeriod}
+                onChange={(e) => setStalePeriod(e.target.value)}
+              >
+                <option value="6months">Last 6 Months</option>
+                <option value="12months">Last 12 Months</option>
+                <option value="2years">Last 2 Years</option>
+                <option value="5years">Last 5 Years</option>
+              </select>
+            </div>
           </div>
           <p className="text-sm text-slate-600 mb-4">
-            The following sites contain files that have not been modified in the last <strong>5 months</strong>.
+            The following sites contain files that have not been modified in the <strong>{getPeriodLabel(stalePeriod).toLowerCase()}</strong>.
             Click to view the specific stale files within each site.
           </p>
           <div className="grid grid-cols-1 gap-2">
